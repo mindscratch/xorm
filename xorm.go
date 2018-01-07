@@ -35,6 +35,7 @@ func regDrvsNDialects() bool {
 		"sqlite3":  {"sqlite3", func() core.Driver { return &sqlite3Driver{} }, func() core.Dialect { return &sqlite3{} }},
 		"oci8":     {"oracle", func() core.Driver { return &oci8Driver{} }, func() core.Dialect { return &oracle{} }},
 		"goracle":  {"oracle", func() core.Driver { return &goracleDriver{} }, func() core.Dialect { return &oracle{} }},
+		"crate":    {"crate", func() core.Driver { return &crateDriver{} }, func() core.Dialect { return &crate{} }},
 	}
 
 	for driverName, v := range providedDrvsNDialects {
