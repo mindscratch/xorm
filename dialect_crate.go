@@ -595,24 +595,26 @@ func (db *crate) ShowCreateNull() bool {
 }
 
 func (db *crate) GetColumns(tableName string) ([]string, map[string]*core.Column, error) {
+	schemaName := "doc"
+	rawTableName := tableName
+	if strings.Contains(tableName, ".") {
+		parts := strings.Split(tableName, ".")
+		schemaName = parts[0]
+		rawTableName = strings.Join(parts[1:], ".")
+	}
 	fmt.Println()
-	fmt.Println("TABLENAME", tableName)
+	fmt.Println("TABLENAME", rawTableName, schemaName)
 	fmt.Println()
 	fmt.Println()
 	fmt.Println("====================")
-	// FIXME: the schema should be replaced by user custom's
-	args := []interface{}{tableName, "public"}
-	s := `SELECT column_name, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix ,
-    CASE WHEN p.contype = 'p' THEN true ELSE false END AS primarykey,
-    CASE WHEN p.contype = 'u' THEN true ELSE false END AS uniquekey
-FROM pg_attribute f
-    JOIN pg_class c ON c.oid = f.attrelid JOIN pg_type t ON t.oid = f.atttypid
-    LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = f.attnum
-    LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-    LEFT JOIN pg_constraint p ON p.conrelid = c.oid AND f.attnum = ANY (p.conkey)
-    LEFT JOIN pg_class AS g ON p.confrelid = g.oid
-    LEFT JOIN INFORMATION_SCHEMA.COLUMNS s ON s.column_name=f.attname AND c.relname=s.table_name
-WHERE c.relkind = 'r'::char AND c.relname = $1 AND s.table_schema = $2 AND f.attnum > 0 ORDER BY f.attnum;`
+	// > crate 2.1 use "information_schema.key_column_usage" to get primary key info
+	// <= 2.1 use "information_schema.table_constraints"
+	// EXTRA --> autoIncrement
+	s := `SELECT c.column_name, c.is_nullable, c.column_default, UPPER(c.data_type), tc.constraint_name, tc.constraint_type FROM information_schema.columns c 
+	LEFT JOIN information_schema.table_constraints tc 
+	ON c.column_name = ANY(tc.constraint_name) AND c.table_schema = tc.table_schema AND c.table_name = tc.table_name
+	WHERE c.table_schema = ? and c.table_name = ?`
+	args := []interface{}{schemaName, rawTableName}
 	db.LogSQL(s, args)
 
 	rows, err := db.DB().Query(s, args...)
@@ -628,72 +630,39 @@ WHERE c.relkind = 'r'::char AND c.relname = $1 AND s.table_schema = $2 AND f.att
 		col := new(core.Column)
 		col.Indexes = make(map[string]int)
 
-		var colName, isNullable, dataType string
-		var maxLenStr, colDefault, numPrecision, numRadix *string
-		var isPK, isUnique bool
-		err = rows.Scan(&colName, &colDefault, &isNullable, &dataType, &maxLenStr, &numPrecision, &numRadix, &isPK, &isUnique)
+		var colName, dataType string
+		var colDefaultVal interface{}
+		var isNullable bool
+		var constraintNamesVal, constraintTypeVal interface{}
+		err = rows.Scan(&colName, &isNullable, &colDefaultVal, &dataType, &constraintNamesVal, &constraintTypeVal)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		//fmt.Println(args, colName, isNullable, dataType, maxLenStr, colDefault, numPrecision, numRadix, isPK, isUnique)
-		var maxLen int
-		if maxLenStr != nil {
-			maxLen, err = strconv.Atoi(*maxLenStr)
-			if err != nil {
-				return nil, nil, err
-			}
+		col.Name = colName
+		if _, ok := core.SqlTypes[dataType]; ok {
+			col.SQLType = core.SQLType{Name: dataType, DefaultLength: 0, DefaultLength2: 0}
+		} else {
+			return nil, nil, fmt.Errorf("Unknown colType %v", dataType)
 		}
-
-		col.Name = strings.Trim(colName, `" `)
-
-		if colDefault != nil || isPK {
-			if isPK {
-				col.IsPrimaryKey = true
-			} else {
-				col.Default = *colDefault
-			}
+		if colDefaultVal != nil {
+			col.Default = colDefaultVal.(string)
 		}
-
-		if colDefault != nil && strings.HasPrefix(*colDefault, "nextval(") {
-			col.IsAutoIncrement = true
-		}
-
-		col.Nullable = (isNullable == "YES")
-
-		switch dataType {
-		case "character varying", "character":
-			col.SQLType = core.SQLType{Name: "string", DefaultLength: 0, DefaultLength2: 0}
-		case "timestamp without time zone":
-			col.SQLType = core.SQLType{Name: core.TimeStamp, DefaultLength: 0, DefaultLength2: 0}
-		case "timestamp with time zone":
-			col.SQLType = core.SQLType{Name: core.TimeStamp, DefaultLength: 0, DefaultLength2: 0}
-		case "double precision":
-			col.SQLType = core.SQLType{Name: core.Double, DefaultLength: 0, DefaultLength2: 0}
-		case "boolean":
-			col.SQLType = core.SQLType{Name: core.Bool, DefaultLength: 0, DefaultLength2: 0}
-		case "time without time zone":
-			col.SQLType = core.SQLType{Name: core.TimeStamp, DefaultLength: 0, DefaultLength2: 0}
-		case "oid":
-			col.SQLType = core.SQLType{Name: core.Long, DefaultLength: 0, DefaultLength2: 0}
-		default:
-			col.SQLType = core.SQLType{Name: strings.ToUpper(dataType), DefaultLength: 0, DefaultLength2: 0}
-		}
-		if _, ok := core.SqlTypes[col.SQLType.Name]; !ok {
-			return nil, nil, fmt.Errorf("Unknown colType: %v", dataType)
-		}
-
-		col.Length = maxLen
-
-		if col.SQLType.IsText() || col.SQLType.IsTime() {
-			if col.Default != "" {
-				col.Default = "'" + col.Default + "'"
-			} else {
-				if col.DefaultIsEmpty {
-					col.Default = "''"
+		if constraintNamesVal != nil && constraintTypeVal != nil {
+			if constraintTypeVal.(string) == "PRIMARY_KEY" {
+				constraintNames := constraintNamesVal.([]interface{})
+				if len(constraintNames) > 0 {
+					for _, name := range constraintNames {
+						if name.(string) == colName {
+							col.IsPrimaryKey = true
+							break
+						}
+					}
 				}
 			}
 		}
+
+		// fmt.Printf("ROW: %s %s %v %t %v\n", colName, dataType, colDefaultVal, isNullable, constraintNamesVal)
 		cols[col.Name] = col
 		colSeq = append(colSeq, col.Name)
 	}
@@ -727,59 +696,21 @@ func (db *crate) GetTables() ([]*core.Table, error) {
 }
 
 func (db *crate) GetIndexes(tableName string) (map[string]*core.Index, error) {
-	// FIXME: replace the public schema to user specify schema
-	args := []interface{}{"public", tableName}
-	s := fmt.Sprintf("SELECT indexname, indexdef FROM pg_indexes WHERE schemaname=$1 AND tablename=$2")
-	db.LogSQL(s, args)
-
-	rows, err := db.DB().Query(s, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	indexes := make(map[string]*core.Index, 0)
-	for rows.Next() {
-		var indexType int
-		var indexName, indexdef string
-		var colNames []string
-		err = rows.Scan(&indexName, &indexdef)
-		if err != nil {
-			return nil, err
-		}
-		indexName = strings.Trim(indexName, `" `)
-		if strings.HasSuffix(indexName, "_pkey") {
-			continue
-		}
-		if strings.HasPrefix(indexdef, "CREATE UNIQUE INDEX") {
-			indexType = core.UniqueType
-		} else {
-			indexType = core.IndexType
-		}
-		cs := strings.Split(indexdef, "(")
-		colNames = strings.Split(cs[1][0:len(cs[1])-1], ",")
-		var isRegular bool
-		if strings.HasPrefix(indexName, "IDX_"+tableName) || strings.HasPrefix(indexName, "UQE_"+tableName) {
-			newIdxName := indexName[5+len(tableName):]
-			isRegular = true
-			if newIdxName != "" {
-				indexName = newIdxName
-			}
-		}
-
-		index := &core.Index{Name: indexName, Type: indexType, Cols: make([]string, 0)}
-		for _, colName := range colNames {
-			index.Cols = append(index.Cols, strings.Trim(colName, `" `))
-		}
-		index.IsRegular = isRegular
-		indexes[index.Name] = index
-	}
-	return indexes, nil
+	return make(map[string]*core.Index, 0), nil
 }
 
 func (db *crate) Filters() []core.Filter {
 	return []core.Filter{&core.IdFilter{}, &core.QuoteFilter{}, &core.SeqFilter{Prefix: "$", Start: 1}}
 }
+
+// func (db *crate) DropTableSql(tableName string) string {
+// 	fmt.Println()
+// 	fmt.Println()
+// 	fmt.Println("----------------->>>> DROP TABLE: ", tableName)
+// 	fmt.Println()
+// 	fmt.Println()
+// 	return ""
+// }
 
 type crateDriver struct {
 }
